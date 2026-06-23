@@ -1,14 +1,25 @@
 package com.example.remoteuisdk
 
 import android.app.Activity
+import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import com.google.gson.Gson
+import java.io.ByteArrayOutputStream
+import java.io.OutputStream
+import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 object RemoteUiSdk {
     private const val TAG = "RemoteUiSdk"
@@ -17,6 +28,10 @@ object RemoteUiSdk {
     var baseUrl: String = ""
     var cachedConfig: CampaignConfig? = null
     var isInitialized = false
+
+    private var activeActivity: WeakReference<Activity>? = null
+    private var serverSocket: ServerSocket? = null
+    private var isServerRunning = false
 
     /**
      * Initializes the SDK and triggers a network thread to fetch the theme config.
@@ -27,6 +42,27 @@ object RemoteUiSdk {
         this.isInitialized = true
 
         Log.d(TAG, "SDK init with API Key: $apiKey")
+
+        // Track active Activity automatically
+        val app = context.applicationContext as? Application
+        app?.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityStarted(activity: Activity) {}
+            override fun onActivityResumed(activity: Activity) {
+                activeActivity = WeakReference(activity)
+            }
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivityStopped(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {
+                if (activeActivity?.get() == activity) {
+                    activeActivity = null
+                }
+            }
+        })
+
+        // Start local debug server for live previews
+        startDebugServer()
 
         // Fetch config from server in a background thread
         Thread {
@@ -70,6 +106,17 @@ object RemoteUiSdk {
                     }
                     cachedConfig = config
                     Log.d(TAG, "Config loaded successfully. Campaign ID: " + cachedConfig?.campaignId)
+                    
+                    // Apply theme color updates if there is an active activity
+                    val activity = activeActivity?.get()
+                    if (activity != null) {
+                        activity.runOnUiThread {
+                            val view = activity.findViewById<View>(android.R.id.content)
+                            if (view != null) {
+                                applyTheme(activity, view)
+                            }
+                        }
+                    }
                 } else {
                     Log.e(TAG, "Server returned response code: $responseCode")
                 }
@@ -168,5 +215,189 @@ object RemoteUiSdk {
                 }
             }
         }
+    }
+
+    private fun startDebugServer() {
+        if (isServerRunning) return
+        isServerRunning = true
+        Thread {
+            try {
+                serverSocket = ServerSocket(8080)
+                Log.d(TAG, "Debug server started on port 8080")
+                while (isServerRunning) {
+                    val socket = serverSocket?.accept() ?: break
+                    Thread { handleClient(socket) }.start()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in debug server: ${e.message}")
+            }
+        }.start()
+    }
+
+    fun stopDebugServer() {
+        isServerRunning = false
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {}
+        serverSocket = null
+    }
+
+    private fun handleClient(socket: Socket) {
+        try {
+            val input = socket.getInputStream()
+            val output = socket.getOutputStream()
+            
+            // Read HTTP headers
+            val headerBuilder = StringBuilder()
+            var c: Int
+            while (true) {
+                c = input.read()
+                if (c == -1) break
+                headerBuilder.append(c.toChar())
+                if (headerBuilder.endsWith("\r\n\r\n")) {
+                    break
+                }
+            }
+            
+            val header = headerBuilder.toString()
+            if (header.isEmpty()) {
+                socket.close()
+                return
+            }
+            
+            val firstLine = header.split("\r\n")[0]
+            val parts = firstLine.split(" ")
+            if (parts.size < 2) {
+                socket.close()
+                return
+            }
+            
+            val method = parts[0]
+            val path = parts[1]
+            
+            if (method == "OPTIONS") {
+                sendResponse(output, "HTTP/1.1 204 No Content\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                        "Access-Control-Allow-Headers: *\r\n" +
+                        "\r\n", ByteArray(0))
+                socket.close()
+                return
+            }
+            
+            if (path.startsWith("/screenshot") && method == "GET") {
+                val activity = activeActivity?.get()
+                if (activity != null) {
+                    val doneSignal = CountDownLatch(1)
+                    var jpegBytes: ByteArray? = null
+                    activity.runOnUiThread {
+                        try {
+                            val view = activity.window.decorView
+                            if (view.width > 0 && view.height > 0) {
+                                val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+                                val canvas = Canvas(bitmap)
+                                view.draw(canvas)
+                                val outStream = ByteArrayOutputStream()
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 70, outStream)
+                                jpegBytes = outStream.toByteArray()
+                                bitmap.recycle()
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Screenshot error: ${e.message}")
+                        } finally {
+                            doneSignal.countDown()
+                        }
+                    }
+                    doneSignal.await(2, TimeUnit.SECONDS)
+                    
+                    if (jpegBytes != null) {
+                        sendResponse(output, "HTTP/1.1 200 OK\r\n" +
+                                "Content-Type: image/jpeg\r\n" +
+                                "Access-Control-Allow-Origin: *\r\n" +
+                                "Content-Length: ${jpegBytes!!.size}\r\n" +
+                                "\r\n", jpegBytes!!)
+                    } else {
+                        sendError(output, 500, "Could not capture screenshot")
+                    }
+                } else {
+                    sendError(output, 404, "No active activity")
+                }
+            } else if (path.startsWith("/config") && method == "POST") {
+                // Read Content-Length
+                var contentLength = 0
+                val lines = header.split("\r\n")
+                for (line in lines) {
+                    if (line.lowercase().startsWith("content-length:")) {
+                        contentLength = line.substring(15).trim().toIntOrNull() ?: 0
+                    }
+                }
+                
+                val bodyBytes = ByteArray(contentLength)
+                var read = 0
+                while (read < contentLength) {
+                    val r = input.read(bodyBytes, read, contentLength - read)
+                    if (r == -1) break
+                    read += r
+                }
+                val body = String(bodyBytes, Charsets.UTF_8)
+                
+                try {
+                    val gson = Gson()
+                    val config = gson.fromJson(body, CampaignConfig::class.java)
+                    cachedConfig = config
+                    
+                    val activity = activeActivity?.get()
+                    if (activity != null) {
+                        activity.runOnUiThread {
+                            val view = activity.findViewById<View>(android.R.id.content)
+                            if (view != null) {
+                                applyTheme(activity, view)
+                            }
+                        }
+                    }
+                    
+                    val responseMsg = "{\"status\":\"success\"}"
+                    val responseBytes = responseMsg.toByteArray(Charsets.UTF_8)
+                    sendResponse(output, "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: application/json\r\n" +
+                            "Access-Control-Allow-Origin: *\r\n" +
+                            "Content-Length: ${responseBytes.size}\r\n" +
+                            "\r\n", responseBytes)
+                } catch (e: Exception) {
+                    sendError(output, 400, "Invalid JSON: ${e.message}")
+                }
+            } else {
+                sendError(output, 404, "Not Found")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling client: ${e.message}")
+        } finally {
+            try {
+                socket.close()
+            } catch (ex: Exception) {}
+        }
+    }
+
+    private fun sendResponse(output: OutputStream, headers: String, body: ByteArray) {
+        output.write(headers.toByteArray(Charsets.UTF_8))
+        if (body.isNotEmpty()) {
+            output.write(body)
+        }
+        output.flush()
+    }
+
+    private fun sendError(output: OutputStream, code: Int, message: String) {
+        val json = "{\"error\":\"$message\"}"
+        val body = json.toByteArray(Charsets.UTF_8)
+        val statusText = when (code) {
+            400 -> "Bad Request"
+            404 -> "Not Found"
+            else -> "Internal Server Error"
+        }
+        sendResponse(output, "HTTP/1.1 $code $statusText\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Content-Length: ${body.size}\r\n" +
+                "\r\n", body)
     }
 }

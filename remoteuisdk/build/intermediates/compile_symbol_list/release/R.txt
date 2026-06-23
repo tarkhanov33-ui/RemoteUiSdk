@@ -1,0 +1,4 @@
+int id btnAddToCart 0x0
+int id promoCard 0x0
+int id toolbar 0x0
+int layout activity_main 0x0

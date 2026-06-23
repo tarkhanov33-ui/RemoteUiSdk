@@ -1,0 +1,10 @@
+[
+    {
+        "merged": "com.example.remoteuisdk-merged_res-30:/animator-v21/m3_appbar_state_list_animator.xml",
+        "source": "com.example.remoteuisdk-material-1.11.0-8:/animator-v21/m3_appbar_state_list_animator.xml"
+    },
+    {
+        "merged": "com.example.remoteuisdk-merged_res-30:/animator-v21/design_appbar_state_list_animator.xml",
+        "source": "com.example.remoteuisdk-material-1.11.0-8:/animator-v21/design_appbar_state_list_animator.xml"
+    }
+]

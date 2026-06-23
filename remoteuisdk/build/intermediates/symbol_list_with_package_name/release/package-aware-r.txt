@@ -1,0 +1,5 @@
+com.example.remoteuisdk
+id btnAddToCart
+id promoCard
+id toolbar
+layout activity_main
