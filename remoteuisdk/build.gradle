@@ -1,6 +1,7 @@
 plugins {
     id 'com.android.library'
     id 'org.jetbrains.kotlin.android'
+    id 'maven-publish'
 }
 
 android {
@@ -39,4 +40,17 @@ dependencies {
     
     // Academic testing framework (JUnit 4)
     testImplementation 'junit:junit:4.13.2'
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.github.tarkhanov33-ui'
+                artifactId = 'remoteuisdk'
+                version = '1.0.0'
+            }
+        }
+    }
 }
